@@ -1,2 +1,2 @@
 # VoidSynth-pb
-dc app
+app
