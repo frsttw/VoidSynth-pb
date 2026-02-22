@@ -1,4 +1,4 @@
-# VoidSynth-pb
+# VoidSynth-project
 Copyright (c) 2026 VoidSynth
 
 This code is available for viewing only.
