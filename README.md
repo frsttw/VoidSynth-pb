@@ -1,2 +1,5 @@
 # VoidSynth-pb
-app
+Copyright (c) 2026 VoidSynth
+
+This code is available for viewing only.
+It is not permitted to copy, modify, redistribute, or use any part of this code without the explicit permission of the author.
