@@ -3,6 +3,10 @@ const { Client, GatewayIntentBits, Partials, PermissionsBitField, EmbedBuilder, 
 const { joinVoiceChannel, VoiceConnectionStatus } = require('@discordjs/voice');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const crypto = require('crypto');
+const { createCanvas, registerFont } = require('canvas');
+const { AttachmentBuilder } = require('discord.js');
 
 // === CONFIGURAÇÃO DO CLIENT ===
 const client = new Client({
@@ -30,15 +34,96 @@ const LEVEL_UP_REWARD_BASE = 166.67; // $166.67 base por subida de nível (1/3 d
 // === VARIÁVEIS GLOBAIS ===
 
 const LEVELS = Array.from({ length: 1000 }, (_, i) => (i + 1) * (i + 1) * 100);
-let xp = {}, autoMessageConfig = {}, voiceConfig = {}, leaderboardConfig = {}, welcomeConfig = {}, antinukeConfig = {}, logConfig = {}, autopfpConfig = {}, economy = {}, economyLeaderboardConfig = {}, rankingRolesConfig = {}, shopConfig = {}, wordFilterConfig = {}, globalConfig = { embedColor: "#000102" };
+let xp = {}, ignoredUsers = {}, customVoiceNames = {}, autoMessageConfig = {}, voiceConfig = {}, leaderboardConfig = {}, welcomeConfig = {}, antinukeConfig = {}, logConfig = {}, autopfpConfig = {}, autoscanpfpConfig = {}, economy = {}, economyLeaderboardConfig = {}, rankingRolesConfig = {}, shopConfig = {}, verifyConfig = {}, wordFilterConfig = {}, updateLogConfig = { channelId: null }, globalConfig = { embedColor: "#000102" }, updateLogBuffer = [];
+let bumpConfig = {};
+let voidSmsConfig = { panelChannelId: null, messagesChannelId: null, logChannelId: null };
+
+// === BUFFER DE LOGS (PERSISTENTE) ===
+// Este buffer armazena as atualizações recentes via updateLogBuffer.json
 let commandsList = []; // Definido globalmente para ser usado no /help
 const voiceXP = {}; // { userId: { guildId: { channelId: timestamp } } }
 
 const leaderboardPages = {};
 const tempVcOwners = new Map(); // Armazena [channelId, ownerId]
 const autopfpIntervals = new Map();
+const autoscanpfpIntervals = new Map();
 const autoMessageIntervals = new Map(); // Armazena [guildId, intervalId] // Armazena [guildId, intervalId]
-const IMAGE_FOLDER = './autopfp_images';
+const IMAGE_FOLDER_BASE = path.join(process.cwd(), 'autopfp_images');
+const MAX_FILES_PER_FOLDER = 1000;
+
+function migrateExistingFiles() {
+    if (!fs.existsSync(IMAGE_FOLDER_BASE)) {
+        fs.mkdirSync(IMAGE_FOLDER_BASE, { recursive: true });
+    }
+    
+    const firstFolder = path.join(IMAGE_FOLDER_BASE, 'folder_1');
+    if (!fs.existsSync(firstFolder)) {
+        fs.mkdirSync(firstFolder, { recursive: true });
+    }
+
+    const items = fs.readdirSync(IMAGE_FOLDER_BASE, { withFileTypes: true });
+    for (const item of items) {
+        if (item.isFile() && /\.(jpe?g|png|gif)$/i.test(item.name)) {
+            const oldPath = path.join(IMAGE_FOLDER_BASE, item.name);
+            const newPath = path.join(firstFolder, item.name);
+            try {
+                fs.renameSync(oldPath, newPath);
+                console.log(`📦 [Migração] Movido: ${item.name} -> folder_1`);
+            } catch (e) {
+                console.error(`❌ [Migração] Erro ao mover ${item.name}:`, e);
+            }
+        }
+    }
+}
+
+function getAutoPfpFolders() {
+    migrateExistingFiles();
+    const folders = fs.readdirSync(IMAGE_FOLDER_BASE, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory() && dirent.name.startsWith('folder_'))
+        .map(dirent => dirent.name)
+        .sort((a, b) => {
+            const numA = parseInt(a.split('_')[1]) || 0;
+            const numB = parseInt(b.split('_')[1]) || 0;
+            return numA - numB;
+        });
+
+    if (folders.length === 0) {
+        const firstFolder = 'folder_1';
+        fs.mkdirSync(path.join(IMAGE_FOLDER_BASE, firstFolder), { recursive: true });
+        return [firstFolder];
+    }
+    return folders;
+}
+
+function getTargetFolderForDownload() {
+    const folders = getAutoPfpFolders();
+    const lastFolder = folders[folders.length - 1];
+    const lastFolderPath = path.join(IMAGE_FOLDER_BASE, lastFolder);
+    const files = fs.readdirSync(lastFolderPath);
+
+    if (files.length >= MAX_FILES_PER_FOLDER) {
+        const nextFolderNum = parseInt(lastFolder.split('_')[1]) + 1;
+        const nextFolderName = `folder_${nextFolderNum}`;
+        const nextFolderPath = path.join(IMAGE_FOLDER_BASE, nextFolderName);
+        fs.mkdirSync(nextFolderPath, { recursive: true });
+        return nextFolderPath;
+    }
+    return lastFolderPath;
+}
+
+function getAllAutoPfpFiles() {
+    const folders = getAutoPfpFolders();
+    let allFiles = [];
+    for (const folder of folders) {
+        const folderPath = path.join(IMAGE_FOLDER_BASE, folder);
+        const files = fs.readdirSync(folderPath)
+            .filter(file => /\.(jpe?g|png|gif)$/i.test(file))
+            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
+            .map(file => ({ name: file, path: path.join(folderPath, file) }));
+        allFiles = allFiles.concat(files);
+    }
+    return allFiles;
+}
 
 
 
@@ -99,7 +184,7 @@ function startAutoMessages(guildId) {
 // === FUNÇÕES DE ARQUIVO ===
 function loadConfig(file, configVar, varName) { try { if (fs.existsSync(file)) { Object.assign(configVar, JSON.parse(fs.readFileSync(file, 'utf8'))); console.log(`✅ ${varName} carregado.`); } else { console.log(`⚠️ Arquivo de ${varName} não encontrado.`); } } catch (e) { console.error(`❌ Erro ao carregar ${varName}:`, e); } }
 function saveConfig(file, configVar) { try { fs.writeFileSync(file, JSON.stringify(configVar, null, 2)); } catch (e) { console.error(`❌ Erro ao salvar ${file}:`, e); } }
-function loadAllConfigs() { loadConfig('./xp.json', xp, 'XP'); loadConfig('./voiceConfig.json', voiceConfig, 'Voz Temporária'); loadConfig('./leaderboard_config.json', leaderboardConfig, 'Leaderboard'); loadConfig('./welcome_config.json', welcomeConfig, 'Boas-vindas'); loadConfig('./logConfig.json', logConfig, 'Logs'); loadConfig('./antinukeConfig.json', antinukeConfig, 'Antinuke'); loadConfig('./autopfpConfig.json', autopfpConfig, 'AutoPFP'); loadConfig('./economy.json', economy, 'Economia'); loadConfig('./economy_leaderboard_config.json', economyLeaderboardConfig, 'Leaderboard Economia'); loadConfig('./ranking_roles_config.json', rankingRolesConfig, 'Cargos de Ranking'); loadConfig('./xpLogConfig.json', xpLogConfig, 'Logs de XP'); loadConfig('./shop_config.json', shopConfig, 'Loja'); loadConfig('./wordFilterConfig.json', wordFilterConfig, 'Filtro de Palavras'); loadConfig('./global_config.json', globalConfig, 'Config Global'); loadConfig('./autoMessageConfig.json', autoMessageConfig, 'Mensagens Automáticas'); }
+function loadAllConfigs() { loadConfig('./xp.json', xp, 'XP'); loadConfig('./voiceConfig.json', voiceConfig, 'Voz Temporária'); loadConfig('./leaderboard_config.json', leaderboardConfig, 'Leaderboard'); loadConfig('./welcome_config.json', welcomeConfig, 'Boas-vindas'); loadConfig('./logConfig.json', logConfig, 'Logs'); loadConfig('./antinukeConfig.json', antinukeConfig, 'Antinuke'); loadConfig('./autopfpConfig.json', autopfpConfig, 'AutoPFP'); loadConfig('./autoscanpfpConfig.json', autoscanpfpConfig, 'AutoScanPFP'); loadConfig('./economy.json', economy, 'Economia'); loadConfig('./economy_leaderboard_config.json', economyLeaderboardConfig, 'Leaderboard Economia'); loadConfig('./ranking_roles_config.json', rankingRolesConfig, 'Cargos de Ranking'); loadConfig('./xpLogConfig.json', xpLogConfig, 'Logs de XP'); loadConfig('./shop_config.json', shopConfig, 'Loja'); loadConfig('./wordFilterConfig.json', wordFilterConfig, 'Filtro de Palavras'); loadConfig('./global_config.json', globalConfig, 'Config Global'); loadConfig('./autoMessageConfig.json', autoMessageConfig, 'Mensagens Automáticas'); loadConfig('./ignoredUsers.json', ignoredUsers, 'Usuários Ignorados'); loadConfig('./customVoiceNames.json', customVoiceNames, 'Nomes de Voz Customizados'); loadConfig('./updateLogConfig.json', updateLogConfig, 'Config de Logs de Update'); loadConfig('./updateLogBuffer.json', updateLogBuffer, 'Buffer de Logs'); loadConfig('./tell_config.json', voidSmsConfig, 'Tell Config'); loadConfig('./bumpConfig.json', bumpConfig, 'Bump Timer'); loadConfig('./verifyConfig.json', verifyConfig, 'Config de Verificação'); }
 const saveXP = () => saveConfig('./xp.json', xp);
 const saveVoiceConfig = () => saveConfig('./voiceConfig.json', voiceConfig);
 const saveLeaderboardConfig = () => saveConfig('./leaderboard_config.json', leaderboardConfig);
@@ -107,14 +192,21 @@ const saveWelcomeConfig = () => saveConfig('./welcome_config.json', welcomeConfi
 const saveLogConfig = () => saveConfig('./logConfig.json', logConfig);
 const saveAntinukeConfig = () => saveConfig('./antinukeConfig.json', antinukeConfig);
 const saveAutoPfpConfig = () => saveConfig('./autopfpConfig.json', autopfpConfig);
+const saveAutoScanPfpConfig = () => saveConfig('./autoscanpfpConfig.json', autoscanpfpConfig);
 	const saveEconomy = () => saveConfig('./economy.json', economy);
 	const saveEconomyLeaderboardConfig = () => saveConfig('./economy_leaderboard_config.json', economyLeaderboardConfig);
 const saveRankingRolesConfig = () => saveConfig('./ranking_roles_config.json', rankingRolesConfig);
 const saveShopConfig = () => saveConfig('./shop_config.json', shopConfig);
+const saveVerifyConfig = () => saveConfig('./verifyConfig.json', verifyConfig);
+const saveBumpConfig = () => saveConfig('./bumpConfig.json', bumpConfig);
 const saveXPLogConfig = () => saveConfig('./xpLogConfig.json', xpLogConfig);
 const saveWordFilterConfig = () => saveConfig('./wordFilterConfig.json', wordFilterConfig);
 const saveGlobalConfig = () => saveConfig('./global_config.json', globalConfig);
 const saveAutoMessageConfig = () => saveConfig('./autoMessageConfig.json', autoMessageConfig);
+const saveIgnoredUsers = () => saveConfig('./ignoredUsers.json', ignoredUsers);
+const saveCustomVoiceNames = () => saveConfig('./customVoiceNames.json', customVoiceNames);
+const saveUpdateLogConfig = () => saveConfig('./updateLogConfig.json', updateLogConfig);
+const saveUpdateLogBuffer = () => saveConfig('./updateLogBuffer.json', updateLogBuffer);
 
 // === FUNÇÕES DE ECONOMIA ===
 	function getUser(userId, username) {
@@ -157,11 +249,12 @@ const saveAutoMessageConfig = () => saveConfig('./autoMessageConfig.json', autoM
 		    return level;
 		}
 		
-		async function addXP(guild, user, channel) {
-		    // Ignora bots e interações sem guild (DMs)
-		    if (user.bot || !guild) return; 
-		    
-		    const guildId = guild.id, userId = user.id;
+async function addXP(guild, user, channel, interaction = null) {
+			    // Ignora bots e interações sem guild (DMs)
+			    if (user.bot || !guild) return; 
+			    
+			    const guildId = guild.id, userId = user.id;
+    if (ignoredUsers[guildId] && ignoredUsers[guildId][userId]) return;
 		    if (!xp[guildId]) xp[guildId] = {};
 		
     // Verifica Cooldown de XP
@@ -189,14 +282,23 @@ const saveAutoMessageConfig = () => saveConfig('./autoMessageConfig.json', autoM
         userData.bank += levelUpReward; // Usa a mesma referência de userData
 
         const levelUpEmbed = new EmbedBuilder()
-            .setColor(globalConfig.embedColor)
-            .setAuthor({ name: "Subida de Nível!", iconURL: "https://i.imgur.com/vM8S9z0.png" })
-            .setDescription(`### <a:money:1242505308442595408> Parabéns, ${user}!\nVocê acaba de alcançar o **Nível ${newLevel}**!`)
-            .addFields({ name: "<a:richxp:1464679900500988150> Recompensa", value: `\`${formatDollars(levelUpReward)}\` adicionados ao seu banco.` })
-            .setThumbnail(user.displayAvatarURL({ dynamic: true }))
-            .setTimestamp();
-        channel.send({ content: `${user}`, embeds: [levelUpEmbed] }).catch(() => {});
-    }
+	            .setColor(globalConfig.embedColor)
+	            .setAuthor({ name: "Subida de Nível!", iconURL: "https://i.imgur.com/vM8S9z0.png" })
+	            .setDescription(`### <a:money:1242505308442595408> Parabéns, ${user}!\nVocê acaba de alcançar o **Nível ${newLevel}**!`)
+	            .addFields({ name: "<a:richxp:1464679900500988150> Recompensa", value: `\`${formatDollars(levelUpReward)}\` adicionados ao seu banco.` })
+	            .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+	            .setTimestamp();
+
+	        if (interaction && interaction.replied) {
+	            interaction.followUp({ embeds: [levelUpEmbed], ephemeral: true }).catch(() => {});
+	        } else if (interaction) {
+	            interaction.reply({ embeds: [levelUpEmbed], ephemeral: true }).catch(() => {});
+	        } else {
+	            channel.send({ content: `${user}`, embeds: [levelUpEmbed] })
+	                .then(msg => setTimeout(() => msg.delete().catch(() => {}), 10000))
+	                .catch(() => {});
+	        }
+	    }
 
     // Salva as alterações de economia (chat reward e/ou level up reward)
     updateUser(userId, userData);
@@ -248,7 +350,7 @@ function rewardVoiceUsers() {
             
             // Varre todos os membros no canal de voz
             channel.members.forEach(member => {
-                if (member.user.bot) return;
+                if (member.user.bot || (ignoredUsers[guildId] && ignoredUsers[guildId][member.id])) return;
                 const userId = member.id;
                 
                 // Inicializa o rastreamento se necessário
@@ -687,7 +789,7 @@ async function updateRankingRoles(guild) {
 
 async function getLeaderboardEmbed(guild, page = 0) { 
     const guildXP = xp[guild.id] || {}; 
-    const sortedXP = Object.entries(guildXP).sort(([, xpA], [, xpB]) => xpB - xpA);
+    const sortedXP = Object.entries(guildXP).filter(([userId]) => !(ignoredUsers[guild.id] && ignoredUsers[guild.id][userId])).sort(([, xpA], [, xpB]) => xpB - xpA);
     const totalPages = Math.ceil(sortedXP.length / 10) || 1;
     const currentPage = Math.max(0, Math.min(page, totalPages - 1));
     
@@ -699,9 +801,9 @@ async function getLeaderboardEmbed(guild, page = 0) {
         .setColor(globalConfig.embedColor)
         .setTitle("<a:money:1242505304227446794> Rank - " + guild.name)
         .setDescription("### <a:nitro:1465295896936841369> Bônus de Impulso\nQuem der **impulso (boost)** no servidor tem direito a **1.5x mais XP e Dinheiro**!\n\nO XP e o Dinheiro são dropados via **chat de voz**, **interações no chat** e muito mais. Continue ativo para subir no ranking!\n\n### <a:money:1242505304227446794> Cargos de Recompensa\n- **TOP 1:** <@&1434914289143250954>\n- **TOP 2:** <@&1434914684561002506>\n- **TOP 3:** <@&1434914601094348880>\n\n### <a:money:1242505308442595408> Comandos de Economia\n- **/bank** - depósito e saque.\n- **/crash** - aposte seu dinheiro.\n- **/balance** - veja seu saldo.\n- **/daily** - receba uma quantidade de dinheiro diariamente.")
-        .setImage("https://i.imgur.com/lNjOG8B.jpeg")
-        .setFooter({ text: "Página " + (currentPage + 1) + " de " + totalPages + " • Ranking • Atualizado a cada 5 minutos" })
-        .setTimestamp();
+        .setFooter({ text: "Página " + (currentPage + 1) + " de " + totalPages + " • Ranking" })
+        .setImage("https://i.imgur.com/LsI8SSq.gif")
+	        .setTimestamp();
 
     if (sortedXP.length === 0) {
         embed.setDescription("Ninguém ainda ganhou XP neste servidor.");
@@ -815,7 +917,7 @@ async function updateAllLeaderboards() {
 		        } 
 		    }
 		}
-function getSupportMessage(guild) { const embed = new EmbedBuilder().setColor(globalConfig.embedColor).setTitle(`Olá, Void | .gg/wvoid 💀! Fui adicionado!`).setDescription(`Sou o **VoidSynth**, seu novo bot de gerenciamento e diversão.\n\nUse \`/help\` para ver minhas funcionalidades.\n\n---\n\n✨ **Apoie o Projeto!**\nSe você gosta do meu trabalho, considere apoiar o desenvolvimento para me manter online e com novas funcionalidades.`).setThumbnail(client.user.displayAvatarURL()).setFooter({ text: `Obrigado por me escolher! | ID: ${guild.id}` }).setTimestamp(); const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('Seja Apoiador (PIX)').setStyle(ButtonStyle.Link).setURL('https://cdn.discordapp.com/attachments/1418607672529387654/1431647616319356948/image.png?ex=68fe2d3e&is=68fcdbbe&hm=af9da616a2ba10430be9b0e90827d098d2bc18b2197ab7e8b035795018fe7832&'  )); return { embeds: [embed], components: [row] }; }
+
 
 // === FUNÇÕES AUTOPFP ===
 function sanitizeFileName(fileName) {
@@ -827,25 +929,86 @@ function sanitizeFileName(fileName) {
     return sanitized + ext;
 }
 
-function getThreeSequentialImages(files, guildId) {
-    if (!autopfpConfig[guildId]) autopfpConfig[guildId] = {};
-    let currentIndex = autopfpConfig[guildId].lastIndex || 0;
-    
-    // Ordena os arquivos alfabeticamente para garantir uma ordem consistente
-    const sortedFiles = files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
-    
-    const selectedImages = [];
-    for (let i = 0; i < 3; i++) {
-        if (currentIndex >= sortedFiles.length) currentIndex = 0;
-        selectedImages.push(sortedFiles[currentIndex]);
-        currentIndex++;
+async function downloadImage(url) {
+    const targetFolder = getTargetFolderForDownload();
+    return new Promise((resolve, reject) => {
+        https.get(url, (res) => {
+            if (res.statusCode !== 200) {
+                res.resume();
+                return resolve(null);
+            }
+
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+                const buffer = Buffer.concat(chunks);
+                const hash = crypto.createHash('md5').update(buffer).digest('hex');
+                
+                // Verifica se já existe um arquivo com esse hash em QUALQUER pasta
+                const allFiles = getAllAutoPfpFiles();
+                for (const file of allFiles) {
+                    if (file.name.startsWith(hash)) {
+                        return resolve(false); // Já existe
+                    }
+                }
+
+                const ext = url.split('.').pop().split('?')[0] || 'png';
+                const fileName = `${hash}.${ext}`;
+                const filePath = path.join(targetFolder, fileName);
+                
+                fs.writeFileSync(filePath, buffer);
+                resolve(true); // Baixado com sucesso
+            });
+        }).on('error', (e) => {
+            console.error(`Erro ao baixar imagem ${url}:`, e);
+            resolve(null);
+        });
+    });
+}
+
+function cleanupDuplicates() {
+    const allFiles = getAllAutoPfpFiles();
+    const seenHashes = new Map();
+    let removedCount = 0;
+
+    for (const file of allFiles) {
+        const hash = file.name.split('.')[0];
+        if (seenHashes.has(hash)) {
+            try {
+                fs.unlinkSync(file.path);
+                removedCount++;
+            } catch (e) {
+                console.error(`Erro ao remover duplicata ${file.path}:`, e);
+            }
+        } else {
+            seenHashes.set(hash, file.path);
+        }
     }
+    return removedCount;
+}
+
+function getNextSequentialImage(allFiles, guildId) {
+    if (!autopfpConfig[guildId]) autopfpConfig[guildId] = {};
+    const config = autopfpConfig[guildId];
+    
+    // Filtra arquivos se necessário
+    let filteredFiles = allFiles;
+    if (config.filter === 'gif') {
+        filteredFiles = allFiles.filter(f => f.name.toLowerCase().endsWith('.gif'));
+    }
+
+    if (filteredFiles.length === 0) return null;
+
+    let currentIndex = config.lastIndex || 0;
+    if (currentIndex >= filteredFiles.length) currentIndex = 0;
+    
+    const selectedImage = filteredFiles[currentIndex];
     
     // Salva o próximo índice para a próxima execução
-    autopfpConfig[guildId].lastIndex = currentIndex;
+    config.lastIndex = currentIndex + 1;
     saveAutoPfpConfig();
     
-    return selectedImages;
+    return selectedImage;
 }
 
 async function runAutoPfp(guildId) {
@@ -853,54 +1016,65 @@ async function runAutoPfp(guildId) {
     if (!config || !config.enabled || !config.channelId) return;
 
     try {
-        if (!fs.existsSync(IMAGE_FOLDER)) {
-            console.error(`❌ Pasta de imagens não encontrada: ${IMAGE_FOLDER}`);
-            return;
-        }
-
-        const allFiles = fs.readdirSync(IMAGE_FOLDER).filter(file => /\.(jpe?g|png|gif)$/i.test(file));
+        const allFiles = getAllAutoPfpFiles();
         if (allFiles.length === 0) {
-            console.warn(`⚠️ Nenhuma imagem encontrada na pasta: ${IMAGE_FOLDER}`);
+            console.warn(`⚠️ Nenhuma imagem encontrada nas pastas de AutoPFP.`);
             return;
         }
 
-        const imagesToSend = getThreeSequentialImages(allFiles, guildId);
         const channel = await client.channels.fetch(config.channelId).catch(() => null);
-
-        if (channel && channel.isTextBased()) {
-            for (const file of imagesToSend) {
-                let currentFile = file;
-                let filePath = path.join(IMAGE_FOLDER, file);
-                
-                // Verifica se o nome do arquivo precisa ser limpo
-                const sanitizedName = sanitizeFileName(file);
-                if (sanitizedName !== file) {
-                    const newPath = path.join(IMAGE_FOLDER, sanitizedName);
-                    try {
-                        fs.renameSync(filePath, newPath);
-                        currentFile = sanitizedName;
-                        filePath = newPath;
-                        console.log(`♻️ [AutoPFP] Arquivo renomeado: "${file}" -> "${sanitizedName}"`);
-                    } catch (err) {
-                        console.error(`❌ [AutoPFP] Erro ao renomear "${file}":`, err);
-                    }
-                }
-
-                const attachment = { attachment: filePath, name: currentFile };
-                
-                const now = new Date();
-                const brtTime = now.toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
-
-                const embed = new EmbedBuilder().setColor(globalConfig.embedColor)
-                    .setImage(`attachment://${currentFile}`) // Referencia o arquivo anexado.
-                    .setColor(globalConfig.embedColor)
-                    .setFooter({ text: `Postado às ${brtTime} (BRT)` });
-
-                await channel.send({ embeds: [embed], files: [attachment] });
-            }
-            console.log(`✅ [AutoPFP] Enviadas 3 imagens em embeds separados para o canal ${channel.id} no servidor ${guildId}`);
-        } else {
+        if (!channel || !channel.isTextBased()) {
             console.error(`❌ [AutoPFP] Canal ${config.channelId} não encontrado ou não é um canal de texto.`);
+            return;
+        }
+
+        const IMAGES_TO_SEND = 3;
+        let sentCount = 0;
+
+        for (let i = 0; i < IMAGES_TO_SEND; i++) {
+            const fileData = getNextSequentialImage(allFiles, guildId);
+            if (!fileData) {
+                console.warn(`⚠️ Nenhuma imagem correspondente ao filtro encontrada na iteração ${i+1}.`);
+                continue;
+            }
+
+            let currentFile = fileData.name;
+            let filePath = fileData.path;
+            
+            // Verifica se o nome do arquivo precisa ser limpo
+            const sanitizedName = sanitizeFileName(currentFile);
+            if (sanitizedName !== currentFile) {
+                const newPath = path.join(path.dirname(filePath), sanitizedName);
+                try {
+                    fs.renameSync(filePath, newPath);
+                    currentFile = sanitizedName;
+                    filePath = newPath;
+                    console.log(`♻️ [AutoPFP] Arquivo renomeado: "${fileData.name}" -> "${sanitizedName}"`);
+                } catch (err) {
+                    console.error(`❌ [AutoPFP] Erro ao renomear "${fileData.name}":`, err);
+                }
+            }
+
+            const attachment = { attachment: filePath, name: currentFile };
+            
+            const now = new Date();
+            const brtTime = now.toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
+
+            // Extrai o número da pasta (ex: folder_1 -> f1)
+            const folderName = path.basename(path.dirname(filePath));
+            const folderMatch = folderName.match(/folder_(\d{1,3})/);
+            const folderId = folderMatch ? `f${folderMatch[1]}` : '';
+
+            const embed = new EmbedBuilder().setColor(globalConfig.embedColor)
+                .setImage(`attachment://${currentFile}`) // Referencia o arquivo anexado.
+                .setFooter({ text: `${folderId} | Postado às ${brtTime} (BRT)` });
+
+            await channel.send({ embeds: [embed], files: [attachment] });
+            sentCount++;
+        }
+        
+        if (sentCount > 0) {
+            console.log(`✅ [AutoPFP] Enviadas ${sentCount} imagens para o canal ${channel.id} no servidor ${guildId}`);
         }
     } catch (e) {
         console.error(`❌ Erro no loop AutoPFP para o servidor ${guildId}:`, e);
@@ -912,8 +1086,8 @@ function startAutoPfpLoop(guildId) {
         clearInterval(autopfpIntervals.get(guildId));
     }
     
-    // Executa imediatamente e depois a cada 5 minutos (300000ms)
-    const interval = setInterval(() => runAutoPfp(guildId), 300000);
+    // Executa imediatamente e depois a cada 1 minuto (60000ms)
+    const interval = setInterval(() => runAutoPfp(guildId), 60000);
     autopfpIntervals.set(guildId, interval);
     runAutoPfp(guildId); // Primeira execução imediata
 }
@@ -932,6 +1106,89 @@ function restartAllAutoPfpLoops() {
         const config = autopfpConfig[guildId];
         if (config.enabled) {
             startAutoPfpLoop(guildId);
+        }
+    }
+}
+
+async function runAutoScanPfp(guildId) {
+    const config = autoscanpfpConfig[guildId];
+    if (!config || !config.enabled || !config.scanChannelId || !config.logChannelId) return;
+
+    try {
+        const scanChannel = await client.channels.fetch(config.scanChannelId).catch(() => null);
+        const logChannel = await client.channels.fetch(config.logChannelId).catch(() => null);
+        
+        if (!scanChannel || !scanChannel.isTextBased()) return;
+
+        const messages = await scanChannel.messages.fetch({ limit: 100 });
+        let captured = 0;
+        let duplicates = 0;
+        let errors = 0;
+
+        for (const msg of messages.values()) {
+            const imageUrls = new Set();
+            msg.attachments.forEach(att => { if (att.contentType?.startsWith('image/')) imageUrls.add(att.url); });
+            msg.embeds.forEach(embed => {
+                if (embed.image) imageUrls.add(embed.image.url);
+                if (embed.thumbnail) imageUrls.add(embed.thumbnail.url);
+            });
+
+            for (const url of imageUrls) {
+                const result = await downloadImage(url);
+                if (result === true) captured++;
+                else if (result === false) duplicates++;
+                else if (result === null) errors++;
+            }
+        }
+
+        const cleanedCount = cleanupDuplicates();
+
+        if (logChannel && logChannel.isTextBased()) {
+            const logEmbed = new EmbedBuilder()
+                .setColor(globalConfig.embedColor)
+                .setTitle('🔄 AutoScanPFP: Relatório Periódico')
+                .setDescription(`Varredura automática concluída no canal ${scanChannel}.`)
+                .addFields(
+                    { name: '📸 Capturadas', value: `\`${captured}\` novas imagens`, inline: true },
+                    { name: '🔄 Duplicadas', value: `\`${duplicates + cleanedCount}\` ignoradas/removidas`, inline: true },
+                    { name: '⚠️ Erros', value: `\`${errors}\` falhas`, inline: true }
+                )
+                .setFooter({ text: `Executado a cada 12 horas.` })
+                .setTimestamp();
+            await logChannel.send({ embeds: [logEmbed] });
+        }
+    } catch (e) {
+        console.error(`❌ Erro no AutoScanPFP para o servidor ${guildId}:`, e);
+    }
+}
+
+function startAutoScanPfpLoop(guildId) {
+    if (autoscanpfpIntervals.has(guildId)) {
+        clearInterval(autoscanpfpIntervals.get(guildId));
+    }
+    
+    // Executa imediatamente
+    runAutoScanPfp(guildId);
+    
+    // Define o intervalo para 12 horas (12 * 60 * 60 * 1000 = 43.200.000 ms)
+    const interval = setInterval(() => runAutoScanPfp(guildId), 43200000);
+    autoscanpfpIntervals.set(guildId, interval);
+}
+
+function stopAutoScanPfpLoop(guildId) {
+    if (autoscanpfpIntervals.has(guildId)) {
+        clearInterval(autoscanpfpIntervals.get(guildId));
+        autoscanpfpIntervals.delete(guildId);
+        return true;
+    }
+    return false;
+}
+
+function restartAllAutoScanPfpLoops() {
+    for (const guildId in autoscanpfpConfig) {
+        const config = autoscanpfpConfig[guildId];
+        if (config.enabled) {
+            startAutoScanPfpLoop(guildId);
         }
     }
 }
@@ -958,9 +1215,10 @@ client.on("ready", async () => {
         await updateAllLeaderboards();
     };
     syncInterval(); // Executa imediatamente ao ligar
-    setInterval(syncInterval, 300000); // Repete a cada 5 minutos
+    setInterval(syncInterval, 60000); // Repete a cada 1 minuto
     
-    restartAllAutoPfpLoops(); // Adicionado para retomar o loop AutoPFP
+	    restartAllAutoPfpLoops(); // Adicionado para retomar o loop AutoPFP
+	    restartAllAutoScanPfpLoops(); // Adicionado para retomar o loop AutoScanPFP
     
     // Inicia os intervalos de mensagens automáticas para todas as guildas configuradas
     for (const guildId in autoMessageConfig) {
@@ -971,9 +1229,74 @@ client.on("ready", async () => {
     
     console.log("✅ Sistemas iniciados.");
 
+    // === ENVIO AUTOMÁTICO DE LOGS DE ATUALIZAÇÃO ===
+    if (updateLogBuffer && updateLogBuffer.length > 0) {
+        console.log("📦 [AutoLog] Novas atualizações detectadas no buffer. Iniciando envio automático...");
+        
+        for (const guildId in updateLogConfig) {
+            const config = updateLogConfig[guildId];
+            if (!config || !config.channelId) continue;
+
+            try {
+                const guild = client.guilds.cache.get(guildId);
+                if (!guild) continue;
+
+                const channel = await guild.channels.fetch(config.channelId).catch(() => null);
+                if (channel && channel.isTextBased()) {
+                    const embed = new EmbedBuilder()
+                        .setColor("#000102")
+                        .setAuthor({ name: "VoidSynth | System Update", iconURL: client.user.displayAvatarURL() })
+                        .setTitle("Changelog de Atualização")
+                        .setDescription("As seguintes alterações foram aplicadas ao núcleo do sistema para melhorar a performance e experiência do usuário.")
+                        .setTimestamp()
+                        .setFooter({ text: " ", iconURL: guild.iconURL() });
+
+                    const changesText = updateLogBuffer.map(log => `### ${log.title}\n${log.description}`).join('\n\n');
+                    embed.addFields({ name: "Alterações Técnicas", value: changesText.substring(0, 1024) });
+
+                    await channel.send({ embeds: [embed] });
+                    console.log(`✅ [AutoLog] Log enviado automaticamente para a guilda ${guildId} no canal ${config.channelId}`);
+                }
+            } catch (e) {
+                console.error(`❌ [AutoLog] Erro ao enviar log automático na guilda ${guildId}:`, e);
+            }
+        }
+        
+        // Limpa o buffer após tentar enviar para todas as guildas configuradas
+        updateLogBuffer = [];
+        saveUpdateLogBuffer(); // Salva o buffer vazio para não repetir o envio no próximo reinício
+        console.log("🧹 [AutoLog] Buffer de logs limpo e salvo após envio automático.");
+    }
+
     // === LISTA DE COMANDOS (LOCAL) ===
     commandsList = [
         { name: 'help', description: 'Exibe a lista de comandos.' },
+        { name: 'updatelog', description: 'Envia o log das últimas atualizações do bot. (Admin)' },
+        { name: 'setupdatelog', description: 'Configura o canal para logs automáticos de atualização. (Admin)', options: [{ name: 'channel', description: 'O canal de texto.', type: ApplicationCommandOptionType.Channel, required: true }] },
+        {
+            name: 'testwelcome',
+            description: 'Testa o embed de boas-vindas marcando um usuário específico. (Admin)',
+            options: [
+                {
+                    name: 'usuario',
+                    type: ApplicationCommandOptionType.User,
+                    description: 'O usuário para simular a entrada.',
+                    required: true
+                }
+            ]
+        },
+        {
+            name: 'ocultrank',
+            description: 'Remove um usuário do sistema de XP, economia e ranking. (Admin)',
+            options: [
+                {
+                    name: 'usuario',
+                    type: ApplicationCommandOptionType.User,
+                    description: 'O usuário a ser ignorado/restaurado (deixe vazio para ver a lista).',
+                    required: false
+                }
+            ]
+        },
                 { name: 'auto-mensagem', description: 'Configura mensagens automáticas recorrentes. (Admin)', options: [
             { name: 'acao', description: 'Ativar, desativar ou ver config.', type: ApplicationCommandOptionType.String, required: true, choices: [{ name: 'Ativar/Configurar', value: 'on' }, { name: 'Desativar', value: 'off' }, { name: 'Configuração Atual', value: 'status' }] },
             { name: 'canal', description: 'Canal onde a mensagem será enviada.', type: ApplicationCommandOptionType.Channel, required: false },
@@ -996,7 +1319,7 @@ client.on("ready", async () => {
         { name: 'crash', description: 'Jogue o famoso Crash e tente multiplicar seus dólares.', options: [{ name: 'bet', description: 'A quantidade de dólares a apostar.', type: ApplicationCommandOptionType.Number, required: true }] },
         { name: 'bank', description: 'Abre o menu do banco para depositar e sacar.' },
         { name: 'avatar', description: 'Mostra o avatar de um usuário.', options: [{ name: 'user', description: 'O usuário.', type: ApplicationCommandOptionType.User, required: false }] },
-        { name: 'apoiador', description: 'Mostra como apoiar o projeto.' },
+
         { name: 'clear', description: 'Apaga mensagens. (Admin)', options: [{ name: 'amount', description: 'Número de mensagens (1-100).', type: ApplicationCommandOptionType.Integer, required: true, minValue: 1, maxValue: 100 }] },
         { name: 'setrankvoid', description: 'Configura o Rank (XP e Economia). (Admin)', options: [{ name: 'channel', description: 'O canal de texto.', type: ApplicationCommandOptionType.Channel, required: true }] },
         { name: 'setupvoice', description: 'Configura o sistema de voz temporário. (Admin)', options: [{ name: 'channel', description: 'O canal para criar salas.', type: ApplicationCommandOptionType.Channel, required: true }, { name: 'category', description: 'A categoria para as novas salas.', type: ApplicationCommandOptionType.Channel, required: true }] },
@@ -1008,7 +1331,17 @@ client.on("ready", async () => {
         { name: 'adminpanel', description: 'Envia o painel de moderação estático no canal atual. (Admin)' },
         { name: 'autopfp', description: 'Configura o loop de envio de imagens automáticas (AutoPFP). (Admin)', options: [
             { name: 'action', description: 'Ação a ser executada.', type: ApplicationCommandOptionType.String, required: true, choices: [{ name: 'start', value: 'start' }, { name: 'stop', value: 'stop' }] },
-            { name: 'channel', description: 'O canal de texto para o AutoPFP (apenas para "start").', type: ApplicationCommandOptionType.Channel, required: false }
+            { name: 'channel', description: 'O canal de texto para o AutoPFP (apenas para "start").', type: ApplicationCommandOptionType.Channel, required: false },
+            { name: 'filter', description: 'Tipo de imagens a enviar.', type: ApplicationCommandOptionType.String, required: false, choices: [{ name: 'Todas as Imagens', value: 'all' }, { name: 'Apenas GIFs', value: 'gif' }] }
+        ] },
+        { name: 'scan-pfp', description: 'Varre um canal em busca de imagens para a pasta AutoPFP. (Admin)', options: [
+            { name: 'channel', description: 'O canal para varrer.', type: ApplicationCommandOptionType.Channel, required: true },
+            { name: 'limit', description: 'Limite de mensagens para varrer (padrão 100).', type: ApplicationCommandOptionType.Integer, required: false }
+        ] },
+        { name: 'autoscanpfp', description: 'Configura o scan automático de imagens a cada 12 horas. (Admin)', options: [
+            { name: 'acao', description: 'Ativar ou desativar o autoscan.', type: ApplicationCommandOptionType.String, required: true, choices: [{ name: 'Ativar', value: 'on' }, { name: 'Desativar', value: 'off' }] },
+            { name: 'canal_scan', description: 'Canal para varrer as imagens.', type: ApplicationCommandOptionType.Channel, required: false },
+            { name: 'canal_log', description: 'Canal para enviar os logs do scan.', type: ApplicationCommandOptionType.Channel, required: false }
         ] },
         { name: 'config-loja', description: 'Configura a loja do servidor. (Admin)', options: [
             { name: 'banner', description: 'URL da imagem/GIF do banner da loja.', type: ApplicationCommandOptionType.String, required: true },
@@ -1034,9 +1367,10 @@ client.on("ready", async () => {
             { name: 'preco10', description: 'Preço 10', type: ApplicationCommandOptionType.Number, required: false }
         ] },
         { name: 'editar-loja', description: 'Edita o visual da loja (Banner, Título, Descrição). (Admin)', options: [
-            { name: 'message_id', description: 'ID da mensagem da loja a ser editada.', type: ApplicationCommandOptionType.String, required: true },
-            { name: 'banner', description: 'Novo URL do banner.', type: ApplicationCommandOptionType.String, required: false },
-            { name: 'titulo', description: 'Novo título personalizado da loja.', type: ApplicationCommandOptionType.String, required: false },
+{ name: 'message_id', description: 'ID da mensagem da loja a ser editada.', type: ApplicationCommandOptionType.String, required: true },
+	            { name: 'banner', description: 'Novo URL do banner ou "remover" para tirar.', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'thumbnail', description: 'Novo URL da thumbnail ou "remover" para tirar.', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'titulo', description: 'Novo título personalizado da loja.', type: ApplicationCommandOptionType.String, required: false },
             { name: 'descricao', description: 'Nova descrição personalizada da loja.', type: ApplicationCommandOptionType.String, required: false }
         ] },
         { name: 'editar-item', description: 'Edita um cargo específico da loja. (Admin)', options: [
@@ -1051,9 +1385,41 @@ client.on("ready", async () => {
         ] },
         { name: 'joinvc', description: 'Conecta o bot ao seu canal de voz e o mantém lá por 24 horas.' },
         { name: 'xplog', description: 'Ativa/Desativa os logs de XP em tempo real. (Admin)', options: [{ name: 'status', description: 'Ativar ou Desativar', type: ApplicationCommandOptionType.String, required: true, choices: [{ name: 'Ativar', value: 'on' }, { name: 'Desativar', value: 'off' }] }, { name: 'canal', description: 'Canal para enviar os logs', type: ApplicationCommandOptionType.Channel, required: false }] },
-        { name: 'atualizarembedscolor', description: 'Atualiza a cor de todos os embeds do bot. (Admin)', options: [
-            { name: 'cor', description: 'A cor em formato HEX (ex: #000102).', type: ApplicationCommandOptionType.String, required: true }
-        ] },
+{ name: 'atualizarembedscolor', description: 'Atualiza a cor de todos os embeds do bot. (Admin)', options: [
+	            { name: 'cor', description: 'A cor em formato HEX (ex: #000102).', type: ApplicationCommandOptionType.String, required: true }
+	        ] },
+	        { name: 'verify', description: 'Configura o painel de resgate de cargos. (Admin)', options: [
+	            { name: 'titulo', description: 'Título do embed.', type: ApplicationCommandOptionType.String, required: true },
+	            { name: 'descricao', description: 'Descrição do embed.', type: ApplicationCommandOptionType.String, required: true },
+	            { name: 'cargo1', description: 'Cargo 1', type: ApplicationCommandOptionType.Role, required: true },
+	            { name: 'banner', description: 'URL da imagem/GIF do banner.', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'emoji1', description: 'Emoji 1', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'cargo2', description: 'Cargo 2', type: ApplicationCommandOptionType.Role, required: false },
+	            { name: 'emoji2', description: 'Emoji 2', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'cargo3', description: 'Cargo 3', type: ApplicationCommandOptionType.Role, required: false },
+	            { name: 'emoji3', description: 'Emoji 3', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'cargo4', description: 'Cargo 4', type: ApplicationCommandOptionType.Role, required: false },
+	            { name: 'emoji4', description: 'Emoji 4', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'cargo5', description: 'Cargo 5', type: ApplicationCommandOptionType.Role, required: false },
+	            { name: 'emoji5', description: 'Emoji 5', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'cargo6', description: 'Cargo 6', type: ApplicationCommandOptionType.Role, required: false },
+	            { name: 'emoji6', description: 'Emoji 6', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'cargo7', description: 'Cargo 7', type: ApplicationCommandOptionType.Role, required: false },
+	            { name: 'emoji7', description: 'Emoji 7', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'cargo8', description: 'Cargo 8', type: ApplicationCommandOptionType.Role, required: false },
+	            { name: 'emoji8', description: 'Emoji 8', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'cargo9', description: 'Cargo 9', type: ApplicationCommandOptionType.Role, required: false },
+	            { name: 'emoji9', description: 'Emoji 9', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'cargo10', description: 'Cargo 10', type: ApplicationCommandOptionType.Role, required: false },
+	            { name: 'emoji10', description: 'Emoji 10', type: ApplicationCommandOptionType.String, required: false }
+	        ] },
+	        { name: 'edit-verify', description: 'Edita um painel de verificação existente. (Admin)', options: [
+{ name: 'message_id', description: 'ID da mensagem do painel.', type: ApplicationCommandOptionType.String, required: true },
+		            { name: 'banner', description: 'Novo URL do banner ou "remover" para tirar.', type: ApplicationCommandOptionType.String, required: false },
+		            { name: 'thumbnail', description: 'Novo URL da thumbnail ou "remover" para tirar.', type: ApplicationCommandOptionType.String, required: false },
+		            { name: 'titulo', description: 'Novo título.', type: ApplicationCommandOptionType.String, required: false },
+	            { name: 'descricao', description: 'Nova descrição.', type: ApplicationCommandOptionType.String, required: false }
+	        ] },
         { name: 'filtro', description: 'Configura o filtro de palavras do servidor. (Admin)', options: [
             { name: 'acao', description: 'Adicionar ou remover palavra.', type: ApplicationCommandOptionType.String, required: true, choices: [{ name: 'Adicionar', value: 'add' }, { name: 'Remover', value: 'remove' }, { name: 'Listar', value: 'list' }] },
             { name: 'palavra', description: 'A palavra a ser filtrada (não necessária para "Listar").', type: ApplicationCommandOptionType.String, required: false }
@@ -1089,9 +1455,19 @@ client.on("ready", async () => {
                 { name: 'botao_link', description: 'Novo link do botão.', type: ApplicationCommandOptionType.String, required: false }
             ]
         },
+        { name: 'voidsms-config', description: 'Configurar canais do Correio Elegante', options: [{ name: 'tipo', description: 'painel, mensagens ou logs', type: ApplicationCommandOptionType.String, required: true, choices: [{name: 'painel', value: 'painel'}, {name: 'mensagens', value: 'mensagens'}, {name: 'logs', value: 'logs'}]}, { name: 'canal', description: 'O canal', type: ApplicationCommandOptionType.Channel, required: true }] },
+        { name: 'voidsms-painel', description: 'Enviar o painel de Correio Elegante' },
+        {
+            name: 'bumptime',
+            description: 'Configura o painel de timer para o Bump. (Admin)',
+            options: [
+                { name: 'canal', description: 'Canal onde o painel será enviado.', type: ApplicationCommandOptionType.Channel, required: false },
+                { name: 'cargo', description: 'Cargo que será notificado no privado.', type: ApplicationCommandOptionType.Role, required: false }
+            ]
+        },
     ];
 
-    // === REGISTRO DE COMANDOS INSTANTÂNEO (GUILD COMMANDS) ===
+     // === REGISTRO DE COMANDOS INSTANTÂNEO (GUILD COMMANDS) ===
     const commands = commandsList;
     const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
 
@@ -1124,6 +1500,102 @@ client.on("ready", async () => {
 
 // === EVENTOS DE INTERAÇÃO ===
 client.on('interactionCreate', async interaction => {
+    
+    // === SISTEMA DE BUMP TIMER ===
+    if (interaction.isCommand() && interaction.commandName === 'bumptime') {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return interaction.reply({ content: '❌ Você precisa de permissão de Administrador para usar este comando.', ephemeral: true });
+        }
+
+        const channel = interaction.options.getChannel('canal') || interaction.channel;
+        const role = interaction.options.getRole('cargo');
+
+        const embed = new EmbedBuilder()
+            .setColor(globalConfig.embedColor)
+            .setTitle('<a:rocket:1466151179049238549> Sistema de Bump')
+            .setDescription('Clique no botão abaixo para iniciar o timer de **2 horas** para o próximo bump.\n\nQuando o tempo acabar, os responsáveis serão notificados no privado!')
+            .setTimestamp();
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId('bumptime_start')
+                .setLabel('Iniciar Timer')
+                .setEmoji('⏰')
+                .setStyle(ButtonStyle.Primary)
+        );
+
+        await channel.send({ embeds: [embed], components: [row] });
+        
+        bumpConfig[interaction.guildId] = {
+            roleId: role ? role.id : null,
+            nextBump: 0,
+            notified: true
+        };
+        saveBumpConfig();
+
+        return interaction.reply({ content: `✅ Painel de Bump configurado em ${channel}${role ? ` com notificação para o cargo ${role}` : ''}.`, ephemeral: true });
+    }
+
+    if (interaction.isButton() && interaction.customId === 'bumptime_start') {
+        const config = bumpConfig[interaction.guildId];
+        if (!config) return interaction.reply({ content: '❌ Este painel não está configurado corretamente. Use `/bumptime` novamente.', ephemeral: true });
+
+        const now = Date.now();
+        if (config.nextBump > now) {
+            const timeLeft = config.nextBump - now;
+            const hours = Math.floor(timeLeft / (1000 * 60 * 60));
+            const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
+            return interaction.reply({ content: `⏳ O timer já está rodando! Faltam **${hours}h ${minutes}m** para o próximo bump.`, ephemeral: true });
+        }
+
+        config.nextBump = now + (2 * 60 * 60 * 1000); // 2 horas
+        config.notified = false;
+        saveBumpConfig();
+
+        const embed = new EmbedBuilder()
+            .setColor('#000102')
+            .setTitle('⏰ Timer Iniciado!')
+            .setDescription(`O timer de 2 horas foi iniciado por ${interaction.user}.\n\nNotificarei os responsáveis quando o bump estiver pronto!`)
+            .setTimestamp();
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+    }
+    
+    // === SISTEMA DE CORREIO ELEGANTE (TELL) ===
+    if (interaction.isCommand()) {
+        if (interaction.commandName === 'voidsms-config') {
+            const tipo = interaction.options.getString('tipo');
+            const canal = interaction.options.getChannel('canal');
+            if (tipo === 'painel') voidSmsConfig.panelChannelId = canal.id;
+            else if (tipo === 'mensagens') voidSmsConfig.messagesChannelId = canal.id;
+            else voidSmsConfig.logChannelId = canal.id;
+            saveVoidSmsConfig();
+            return interaction.reply({ content: `✅ Canal de ${tipo} definido para ${canal}`, ephemeral: true });
+        }
+        if (interaction.commandName === 'voidsms-painel') {
+            const embed = new EmbedBuilder()
+                .setColor('#000102')
+                .setTitle('<a:1689ringingphone:1477618983724253326> Void SMS')
+                .setDescription('**Bem-vindo ao Void SMS!**\n\nEnvie mensagens anônimas ou públicas para outros membros do servidor.\n\n**Como funciona:**\n<a:Seta:1470422235083702520> Clique no botão "Enviar" abaixo\n<a:Seta:1470422235083702520> Escolha o destinatário pelo nome\n<a:Seta:1470422235083702520> Escreva sua mensagem\n<a:Seta:1470422235083702520> Escolha se quer ser anônimo ou não\n<a:Seta:1470422235083702520> Pague **$2.500** do seu banco\n\n**Observações:**\n• Mensagens são entregues em um card visual profissional\n• Você precisa ter saldo suficiente no banco\n• Mensagens anônimas não revelam seu nome\n\n<a:blackheart:1362050539042377758> Aproveite!')
+                .setImage('https://i.imgur.com/LsI8SSq.gif')
+                .setColor('#000102');
+            const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('voidsms_send').setLabel('Enviar').setStyle(ButtonStyle.Primary));
+            return interaction.reply({ embeds: [embed], components: [row] });
+        }
+    }
+    if (interaction.isButton() && interaction.customId === 'voidsms_send') {
+        const modal = new ModalBuilder().setCustomId('voidsms_modal').setTitle('Void SMS - Enviar Mensagem');
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('voidsms_recipient').setLabel('Nome do Destinatário').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Digite o nome ou menção')),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('voidsms_message').setLabel('Sua Mensagem').setStyle(TextInputStyle.Paragraph).setRequired(true).setPlaceholder('Escreva sua mensagem aqui...')),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('voidsms_anonymous').setLabel('Anônimo? (sim/não)').setStyle(TextInputStyle.Short).setValue('não').setRequired(true).setPlaceholder('Digite: sim ou não'))
+        );
+        return interaction.showModal(modal);
+    }
+    if (interaction.isModalSubmit() && interaction.customId === 'voidsms_modal') {
+        return handleVoidSmsModal(interaction);
+    }
     // === HANDLER DE PAGINAÇÃO DO LEADERBOARD ===
     if (interaction.isButton()) {
         const [type, action, currentPageStr] = (interaction.customId || "").split('_');
@@ -1170,7 +1642,7 @@ client.on('interactionCreate', async interaction => {
 		            await interaction.channel.send({ content: `${interaction.user}`, embeds: [embed] }); // Envia a mensagem pública
 		            
 		            // Adiciona XP após interação bem-sucedida
-		            await addXP(interaction.guild, interaction.user, interaction.channel);
+		            await addXP(interaction.guild, interaction.user, interaction.channel, interaction);
 		            
 		            return;
 		        }
@@ -1204,7 +1676,7 @@ client.on('interactionCreate', async interaction => {
 			            await interaction.channel.send({ content: `${interaction.user}`, embeds: [embed] }); // Envia a mensagem pública
 			            
 			            // Adiciona XP após interação bem-sucedida
-			            await addXP(interaction.guild, interaction.user, interaction.channel);
+			            await addXP(interaction.guild, interaction.user, interaction.channel, interaction);
 			            
 			            return;
 			        }
@@ -1287,11 +1759,13 @@ client.on('interactionCreate', async interaction => {
 	    }
 	    if (interaction.isButton()) {
 if (interaction.customId === 'bank_deposit') {
-		            return handleDeposit(interaction);
-		        }
-		        if (interaction.customId === 'bank_withdraw') {
-		            return handleWithdraw(interaction);
-		        }
+			            return handleDeposit(interaction);
+			        }
+			        if (interaction.customId === 'bank_withdraw') {
+			            return handleWithdraw(interaction);
+			        }
+			        
+
 		        
 			        const [action] = interaction.customId.split('_');
 				
@@ -1423,7 +1897,26 @@ if (interaction.customId === 'bank_deposit') {
 		    }
 	
 if (interaction.isStringSelectMenu()) {
-		        if (interaction.customId === 'shop_buy_menu') {
+			        if (interaction.customId === 'verify_select_menu') {
+			            const roleId = interaction.values[0];
+			            const role = interaction.guild.roles.cache.get(roleId);
+			
+			            if (!role) return interaction.reply({ content: "❌ Cargo não encontrado.", ephemeral: true });
+			
+			            try {
+			                if (interaction.member.roles.cache.has(roleId)) {
+			                    await interaction.member.roles.remove(roleId);
+			                    return interaction.reply({ content: `✅ Você removeu o cargo **${role.name}**.`, ephemeral: true });
+			                } else {
+			                    await interaction.member.roles.add(roleId);
+			                    return interaction.reply({ content: `✅ Você resgatou o cargo **${role.name}**!`, ephemeral: true });
+			                }
+			            } catch (e) {
+			                return interaction.reply({ content: "❌ Erro ao gerenciar cargo. Verifique minhas permissões.", ephemeral: true });
+			            }
+			        }
+			
+			        if (interaction.customId === 'shop_buy_menu') {
 		            const roleId = interaction.values[0];
 		            const guildId = interaction.guildId;
 		            const shop = shopConfig[guildId];
@@ -1440,7 +1933,7 @@ if (interaction.isStringSelectMenu()) {
 		            }
 		            
 		            if (user.bank < item.price) {
-		                return interaction.reply({ content: `❌ Você não tem saldo suficiente no banco. Preço: **${formatDollars(item.price)}**`, ephemeral: true });
+		                return interaction.reply({ content: `<a:xo_cross:1477009057427624072> Você não tem saldo suficiente no banco. Preço: **${formatDollars(item.price)}**`, ephemeral: true });
 		            }
 		            
 		            try {
@@ -1556,10 +2049,10 @@ if (interaction.isStringSelectMenu()) {
     // Comandos que não devem conceder XP (Admin, Configuração, etc.)
 		    const noXpCommands = ['setruleschannel', 'setrankvoid', 'setrankingroles', 'clear', 'setupvoice', 'vcpanel', 'setregister', 'setwelcome', 'setlogchannel', 'antinuke', 'adminpanel', 'autopfp', 'config-loja', 'embed', 'edit-embed'];
 		
-		    // Adiciona XP para comandos que não estão na lista de exclusão
-		    if (!noXpCommands.includes(commandName)) {
-		        await addXP(interaction.guild, interaction.user, interaction.channel);
-		    }
+// Adiciona XP para comandos que não estão na lista de exclusão
+			    if (!noXpCommands.includes(commandName)) {
+			        await addXP(interaction.guild, interaction.user, interaction.channel, interaction);
+			    }
 		    
 		    
 			    if (commandName === 'xplog') {
@@ -1643,6 +2136,74 @@ if (status === 'on') {
             startAutoMessages(guildId);
 
             return interaction.reply({ content: `✅ Mensagens automáticas configuradas com sucesso! Elas serão enviadas em <#${canal.id}> a cada ${intervaloMin} minutos.`, ephemeral: true });
+        }
+    }
+    
+    if (commandName === 'testwelcome') {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return interaction.reply({ content: "❌ Você precisa ser administrador para usar este comando.", ephemeral: true });
+        }
+
+        const targetMember = options.getMember('usuario');
+        const config = welcomeConfig[interaction.guildId];
+
+        if (!config?.welcomeChannelId) {
+            return interaction.reply({ content: "❌ O canal de boas-vindas não está configurado. Use `/setwelcome` primeiro.", ephemeral: true });
+        }
+
+        const channel = await interaction.guild.channels.fetch(config.welcomeChannelId).catch(() => null);
+        if (!channel) {
+            return interaction.reply({ content: "❌ Não consegui encontrar o canal de boas-vindas configurado.", ephemeral: true });
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor(globalConfig.embedColor)
+            .setTitle(`Bem-vindo(a) ao Void <:0knife:1419332665949032600>!`)
+            .setDescription(`<a:blackheart:1362050539042377758> **Wsp** ${targetMember}\n**não se esqueça de checar** <#1418634171164921919>.`)
+            .setThumbnail(targetMember.user.displayAvatarURL({ dynamic: true, size: 512 }))
+            .setFooter({ text: `Usuário: ${targetMember.user.tag}` })
+            .setTimestamp();
+
+        await channel.send({ embeds: [embed] });
+        return interaction.reply({ content: `✅ Teste de boas-vindas enviado para ${channel}!`, ephemeral: true });
+    }
+
+    if (commandName === 'ocultrank') {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return interaction.reply({ content: "❌ Você precisa ser administrador para usar este comando.", ephemeral: true });
+        }
+
+        const targetUser = options.getUser('usuario');
+        const guildId = interaction.guildId;
+
+        if (!ignoredUsers[guildId]) ignoredUsers[guildId] = {};
+
+        // Se nenhum usuário for fornecido, mostra a lista
+        if (!targetUser) {
+            const ignoredList = Object.keys(ignoredUsers[guildId]);
+            if (ignoredList.length === 0) {
+                return interaction.reply({ content: "ℹ️ Não há nenhum usuário na lista de ocultos no momento.", ephemeral: true });
+            }
+
+            const listString = ignoredList.map(id => `<@${id}> (\`${id}\`)`).join('\n');
+            const embed = new EmbedBuilder()
+                .setColor(globalConfig.embedColor)
+                .setTitle("🚫 Usuários Ocultos do Ranking")
+                .setDescription(`Estes usuários não recebem XP/Dinheiro e não aparecem no rank:\n\n${listString}`)
+                .setFooter({ text: "Para remover alguém, use /ocultrank @usuario" });
+
+            return interaction.reply({ embeds: [embed], ephemeral: true });
+        }
+
+        // Lógica de alternar (toggle)
+        if (ignoredUsers[guildId][targetUser.id]) {
+            delete ignoredUsers[guildId][targetUser.id];
+            saveIgnoredUsers();
+            return interaction.reply({ content: `✅ ${targetUser} foi removido da lista de ocultos e voltará a receber XP e aparecer no rank.`, ephemeral: true });
+        } else {
+            ignoredUsers[guildId][targetUser.id] = true;
+            saveIgnoredUsers();
+            return interaction.reply({ content: `✅ ${targetUser} agora está sendo ignorado pelo sistema de XP, economia e ranking.`, ephemeral: true });
         }
     }
     if (commandName === 'ping') return reply(`🏓 Latência: ${client.ws.ping}ms`, false);
@@ -1785,7 +2346,6 @@ if (status === 'on') {
                 .setAuthor({ name: `Perfil de XP | ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL({ dynamic: true }) })
                 .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true }))
                 .setDescription(`### <a:xp:1320858569037582336> Informações de Nível\nAtualmente você está no **Nível ${level}**.\n\n**Progresso:**\n\`${progressBar}\` **${progress.toFixed(1)}%**\n\n**XP Atual:** \`${userXP}\` / \`${nextLevelXP}\`\n\n### <a:money:1242505304227446794> Cargos de Recompensa\n- **TOP 1:** <@&1434914289143250954>\n- **TOP 2:** <@&1434914684561002506>\n- **TOP 3:** <@&1434914601094348880>\n\n### <a:money:1242505308442595408> Comandos de Economia\n- **/bank** - depósito e saque.\n- **/crash** - aposte seu dinheiro.\n- **/balance** - veja seu saldo.\n- **/daily** - receba uma quantidade de dinheiro diariamente.`)
-                .setImage("https://i.imgur.com/lNjOG8B.jpeg")
                 .setFooter({ text: "Ranking • Continue interagindo para subir!" })
                 .setTimestamp();
 
@@ -1813,7 +2373,7 @@ if (status === 'on') {
 				    }
 				    // ==========================
 		
-			    if (commandName === 'apoiador') return interaction.reply(getSupportMessage(interaction.guild));
+
 			
 			    if (commandName === 'joinvc') {
 			        await handleJoinVC(interaction);
@@ -1864,27 +2424,27 @@ if (status === 'on') {
 		        case 'autopfp': {
 	            const action = options.getString('action');
 	            const channel = options.getChannel('channel');
+	            const filter = options.getString('filter') || 'all';
 	
 	            if (action === 'start') {
 	                if (!channel || !channel.isTextBased()) return reply("❌ Para iniciar, você deve fornecer um canal de texto válido.");
 	                
-	                // Cria a pasta se não existir (para o usuário colocar as imagens)
-	                const folderPath = path.join(process.cwd(), IMAGE_FOLDER); // Caminho absoluto para a pasta
-	                if (!fs.existsSync(folderPath)) {
-	                    fs.mkdirSync(folderPath);
-	                    return reply(`✅ Pasta de imagens **${IMAGE_FOLDER}** criada. Coloque suas imagens lá e execute o comando novamente. (Caminho: \`${folderPath}\`)`);
-	                }
-	                
-	                // Verifica se há imagens
-	                const allFiles = fs.readdirSync(folderPath).filter(file => /\.(jpe?g|png|gif)$/i.test(file));
-	                if (allFiles.length === 0) return reply(`❌ Nenhuma imagem encontrada na pasta **${IMAGE_FOLDER}**. Adicione imagens e tente novamente.`);
+	                // Verifica se há imagens nas pastas
+	                const allFiles = getAllAutoPfpFiles();
+	                if (allFiles.length === 0) return reply(`❌ Nenhuma imagem encontrada nas pastas de AutoPFP. Use \`/scan-pfp\` ou adicione imagens manualmente em \`${IMAGE_FOLDER_BASE}/folder_1\`.`);
 	                
 	                // Salva a configuração e inicia o loop
-	                autopfpConfig[interaction.guildId] = { enabled: true, channelId: channel.id };
+	                autopfpConfig[interaction.guildId] = { 
+	                    enabled: true, 
+	                    channelId: channel.id, 
+	                    filter: filter,
+	                    lastIndex: 0 
+	                };
 	                saveAutoPfpConfig();
 	                startAutoPfpLoop(interaction.guildId);
 	                
-	                return reply(`✅ AutoPFP iniciado! Enviando 3 imagens em ordem sequencial a cada 5 minutos em ${channel}.`);
+	                const filterText = filter === 'gif' ? 'apenas GIFs' : 'todas as imagens';
+	                return reply(`✅ AutoPFP iniciado! Enviando 1 imagem (${filterText}) a cada 1 minuto em ${channel}.`);
 	            }
 	
 	            if (action === 'stop') {
@@ -1898,6 +2458,93 @@ if (status === 'on') {
 	            }
 	            return reply("❌ Ação inválida. Use 'start' ou 'stop'.");
 	        }
+	
+		        case 'scan-pfp': {
+		            const channel = options.getChannel('channel');
+		            const limit = options.getInteger('limit') || 100;
+		
+		            if (!channel || !channel.isTextBased()) return reply('❌ O canal deve ser um canal de texto.');
+		
+		            await interaction.deferReply();
+		
+		            try {
+		                const messages = await channel.messages.fetch({ limit: limit });
+		                let captured = 0;
+		                let duplicates = 0;
+		                let errors = 0;
+		
+		                for (const msg of messages.values()) {
+		                    const imageUrls = new Set();
+		
+		                    // Captura anexos
+		                    msg.attachments.forEach(att => {
+		                        if (att.contentType?.startsWith('image/')) imageUrls.add(att.url);
+		                    });
+		
+		                    // Captura imagens em embeds
+		                    msg.embeds.forEach(embed => {
+		                        if (embed.image) imageUrls.add(embed.image.url);
+		                        if (embed.thumbnail) imageUrls.add(embed.thumbnail.url);
+		                    });
+		
+		                    for (const url of imageUrls) {
+		                        const result = await downloadImage(url);
+		                        if (result === true) captured++;
+		                        else if (result === false) duplicates++;
+		                        else if (result === null) errors++;
+		                    }
+		                }
+		
+		                // Realiza a limpeza de duplicatas em todas as pastas após o download
+		                const cleanedCount = cleanupDuplicates();
+		
+		                const logEmbed = new EmbedBuilder()
+		                    .setColor(globalConfig.embedColor)
+		                    .setTitle('📊 Log de Varredura AutoPFP')
+		                    .setDescription(`Varredura concluída no canal ${channel}.`)
+		                    .addFields(
+		                        { name: '📸 Capturadas', value: `\`${captured}\` novas imagens`, inline: true },
+		                        { name: '🔄 Duplicadas', value: `\`${duplicates + cleanedCount}\` ignoradas/removidas`, inline: true },
+		                        { name: '⚠️ Erros', value: `\`${errors}\` falhas`, inline: true }
+		                    )
+		                    .setFooter({ text: `Limite de mensagens: ${limit} | Limpeza global realizada.` })
+		                    .setTimestamp();
+		
+		                await interaction.editReply({ embeds: [logEmbed] });
+		            } catch (e) {
+		                console.error('Erro ao varrer canal:', e);
+		                await interaction.editReply('❌ Ocorreu um erro ao tentar varrer o canal.');
+		            }
+		            break;
+		        }
+		        case 'autoscanpfp': {
+		            const acao = options.getString('acao');
+		            const canalScan = options.getChannel('canal_scan');
+		            const canalLog = options.getChannel('canal_log');
+		
+		            if (acao === 'on') {
+		                if (!canalScan || !canalLog) return reply("❌ Para ativar, você deve fornecer o canal de scan e o canal de log.");
+		                if (!canalScan.isTextBased() || !canalLog.isTextBased()) return reply("❌ Ambos os canais devem ser canais de texto.");
+		
+		                autoscanpfpConfig[interaction.guildId] = {
+		                    enabled: true,
+		                    scanChannelId: canalScan.id,
+		                    logChannelId: canalLog.id
+		                };
+		                saveAutoScanPfpConfig();
+		                startAutoScanPfpLoop(interaction.guildId);
+		
+		                return reply(`✅ AutoScanPFP ativado! Varrendo ${canalScan} a cada 12 horas e enviando logs em ${canalLog}. A primeira varredura foi iniciada agora.`);
+		            } else {
+		                if (stopAutoScanPfpLoop(interaction.guildId)) {
+		                    autoscanpfpConfig[interaction.guildId].enabled = false;
+		                    saveAutoScanPfpConfig();
+		                    return reply("✅ AutoScanPFP desativado com sucesso.");
+		                } else {
+		                    return reply("❌ O AutoScanPFP não estava ativo neste servidor.");
+		                }
+		            }
+		        }
 	        case 'clear': await interaction.channel.bulkDelete(options.getInteger('amount'), true).catch(() => {}); return reply(`✅ Mensagens apagadas.`);
 
 		            
@@ -1923,7 +2570,7 @@ if (status === 'on') {
 			                // Tenta aplicar os cargos imediatamente
 			                await updateRankingRoles(interaction.guild);
 
-			                return reply(`✅ Cargos de Ranking configurados! Top 1: ${role1}, Top 2: ${role2}, Top 3: ${role3}. Os cargos serão atualizados a cada 5 minutos.`);
+			                return reply(`✅ Cargos de Ranking configurados! Top 1: ${role1}, Top 2: ${role2}, Top 3: ${role3}. Os cargos serão atualizados a cada 1 minuto.`);
 			            }
 				            case 'setrankvoid': { const channel = options.getChannel('channel'); if (!channel.isTextBased()) return reply("❌ O canal deve ser de texto."); await interaction.deferReply({ ephemeral: true }); try { const lbData = await getLeaderboardEmbed(interaction.guild); const message = await channel.send({ embeds: lbData.embeds, components: lbData.components }); leaderboardConfig[interaction.guildId] = { channelId: channel.id, messageId: message.id }; saveLeaderboardConfig(); return interaction.editReply(`✅ Rank configurado em ${channel}.`); } catch (e) { return interaction.editReply("❌ Erro. Verifique minhas permissões no canal."); } }
 	        case 'setupvoice': { const channel = options.getChannel('channel'); const category = options.getChannel('category'); if (channel.type !== 2) return reply("❌ O canal de criação deve ser de voz."); if (category.type !== 4) return reply("❌ A categoria deve ser uma categoria."); voiceConfig[interaction.guildId] = { categoryId: category.id, createChannelId: channel.id }; saveVoiceConfig(); return reply(`✅ Sistema de voz temporária configurado!`); }
@@ -1954,9 +2601,41 @@ if (status === 'on') {
 	                new ButtonBuilder().setCustomId('admin_warn').setLabel('Avisar').setStyle(ButtonStyle.Primary).setEmoji('⚠️')
 	            );
 
-	            await interaction.channel.send({ embeds: [embed], components: [row1, row2] });
-	            return reply("✅ Painel de moderação estático enviado com sucesso!", true);
-	        }
+		            await interaction.channel.send({ embeds: [embed], components: [row1, row2] });
+		            return reply("✅ Painel de moderação estático enviado com sucesso!", true);
+		        }
+		        case 'updatelog': {
+		            if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return reply("❌ Você precisa ser administrador.");
+		            
+		            if (!updateLogBuffer || updateLogBuffer.length === 0) return reply("ℹ️ Não há novas atualizações registradas no momento.");
+
+		            const embed = new EmbedBuilder()
+		                .setColor("#000102")
+		                .setAuthor({ name: "VoidSynth | System Update", iconURL: client.user.displayAvatarURL() })
+		                .setTitle("Changelog de Atualização")
+		                .setDescription("As seguintes alterações foram aplicadas ao núcleo do sistema para melhorar a performance e experiência do usuário.")
+		                .setTimestamp()
+		                .setFooter({ text: " ", iconURL: interaction.guild.iconURL() });
+
+		            const changesText = updateLogBuffer.map(log => `### ${log.title}\n${log.description}`).join('\n\n');
+		            embed.addFields({ name: "Alterações Técnicas", value: changesText.substring(0, 1024) });
+
+                    await interaction.channel.send({ embeds: [embed] });
+                    
+                    updateLogBuffer = [];
+                    saveUpdateLogBuffer(); // Salva o buffer vazio
+                    
+                    return reply({ content: "✅ Log de atualização enviado e buffer limpo.", ephemeral: true });
+		        }
+		        case 'setupdatelog': {
+		            if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return reply("❌ Você precisa ser administrador.");
+		            const channel = options.getChannel('channel');
+		            if (!channel.isTextBased()) return reply("❌ O canal deve ser de texto.");
+		            
+		            updateLogConfig[interaction.guildId] = { channelId: channel.id };
+		            saveUpdateLogConfig();
+		            return reply(`✅ Canal de logs de atualização configurado para ${channel}.`);
+		        }
 	
 	        case 'vcpanel': {
 	            const embed = new EmbedBuilder().setColor(globalConfig.embedColor)
@@ -1964,17 +2643,15 @@ if (status === 'on') {
 	                .setTitle("Menu do Gerenciador de Voz")
 	                .setDescription("Bem-vindo à interface do Gerenciador de Voz! Aqui você pode gerenciar seus canais de voz com facilidade. Abaixo estão as opções disponíveis.")
 	                .addFields(
-	                    { name: "Trancar", value: "Tranca seu canal de voz.", inline: true },
-	                    { name: "Destrancar", value: "Destranca seu canal de voz.", inline: true },
-	                    { name: "Ocultar", value: "Oculta seu canal de voz.", inline: true },
-	                    { name: "Revelar", value: "Revela seu canal de voz oculto.", inline: true },
-	                    { name: "Renomear", value: "Renomeia seu canal de voz.", inline: true },
-	                    { name: "Reivindicar", value: "Reivindica um canal de voz sem dono.", inline: true },
-	                    { name: "Aumentar", value: "Aumenta o limite de usuários.", inline: true },
-	                    { name: "Diminuir", value: "Diminui o limite de usuários.", inline: true },
-	                    { name: "Expulsar", value: "Expulsa um usuário do seu canal.", inline: true },
-	                    { name: "Deletar", value: "Deleta seu canal de voz.", inline: true },
-	
+	                    { name: "🔒 Trancar", value: "Tranca seu canal de voz.", inline: true },
+	                    { name: "🔓 Destrancar", value: "Destranca seu canal de voz.", inline: true },
+	                    { name: "👁️ Ocultar", value: "Oculta seu canal de voz.", inline: true },
+	                    { name: "📢 Revelar", value: "Revela seu canal de voz oculto.", inline: true },
+	                    { name: "✏️ Renomear", value: "Renomeia seu canal de voz.", inline: true },
+	                    { name: "👑 Reivindicar", value: "Reivindica um canal de voz sem dono.", inline: true },
+	                    { name: "➕ Aumentar", value: "Aumenta o limite de usuários.", inline: true },
+	                    { name: "➖ Diminuir", value: "Diminui o limite de usuários.", inline: true },
+	                    { name: "🚫 Expulsar", value: "Expulsa um usuário do seu canal.", inline: true }
 	                )
 	                .setThumbnail(client.user.displayAvatarURL());
 	            const row1 = new ActionRowBuilder().addComponents(
@@ -1996,10 +2673,83 @@ if (status === 'on') {
 	        case 'setregister': { const channel = options.getChannel('channel'); const role = options.getRole('role'); const gifUrl = options.getString('gif_url'); if (!channel.isTextBased()) return reply("❌ O canal deve ser de texto."); const description = `Clique no botão para receber o cargo **${role.name}** e acessar o servidor.`; const embed = new EmbedBuilder().setColor(globalConfig.embedColor).setTitle("🚨 Verificação").setDescription(description).setColor(globalConfig.embedColor); if (gifUrl) embed.setImage(gifUrl); const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`register_${role.id}`).setLabel('Verificar').setStyle(ButtonStyle.Success)); await channel.send({ embeds: [embed], components: [row] }).then(() => reply(`✅ Mensagem de registro enviada.`)).catch(() => reply("❌ Erro ao enviar a mensagem.")); return; }
 	        case 'setwelcome': case 'setlogchannel': { const channel = options.getChannel('channel'); if (!channel.isTextBased()) return reply("❌ O canal deve ser de texto."); const config = commandName === 'setwelcome' ? welcomeConfig : logConfig; const key = commandName === 'setwelcome' ? 'welcomeChannelId' : 'channelId'; config[interaction.guildId] = { [key]: channel.id }; commandName === 'setwelcome' ? saveWelcomeConfig() : saveLogConfig(); return reply(`✅ Canal de ${commandName === 'setwelcome' ? 'boas-vindas' : 'logs'} configurado para ${channel}.`); }
 case 'antinuke': { if (!antinukeConfig[interaction.guildId]) antinukeConfig[interaction.guildId] = { enabled: false, maxDeletes: 3, timeWindow: 10 }; antinukeConfig[interaction.guildId].enabled = options.getString('action') === 'enable'; saveAntinukeConfig(); return reply(`✅ Sistema Antinuke **${options.getString('action') === 'enable' ? 'ATIVADO' : 'DESATIVADO'}**.`); }
-				        case 'config-loja':
-				        case 'editar-loja':
-				        case 'editar-item':
-				        case 'atualizar-loja': {
+case 'verify':
+						        case 'edit-verify': {
+						            if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return reply("❌ Você precisa ser administrador.");
+						
+						            const isEdit = commandName === 'edit-verify';
+						            const messageId = isEdit ? options.getString('message_id') : null;
+						            let currentVerify = isEdit ? verifyConfig[messageId] : null;
+						
+						            if (isEdit && !currentVerify) return reply("❌ Painel não encontrado. Verifique o ID da mensagem.");
+						
+let bannerInput = options.getString('banner');
+							            let newBanner = isEdit ? (bannerInput === 'remover' ? null : (bannerInput || currentVerify.banner)) : bannerInput;
+							            let thumbInput = options.getString('thumbnail');
+							            let newThumb = isEdit ? (thumbInput === 'remover' ? null : (thumbInput || (currentVerify ? currentVerify.thumbnail : null))) : thumbInput;
+							            let newTitle = isEdit ? (options.getString('titulo') || (currentVerify ? currentVerify.title : null)) : options.getString('titulo');
+							            let newDescription = isEdit ? (options.getString('descricao') || (currentVerify ? currentVerify.description : null)) : options.getString('descricao');
+						            let items = isEdit ? JSON.parse(JSON.stringify(currentVerify.items)) : [];
+						
+						            if (!isEdit) {
+						                items = [];
+						                for (let i = 1; i <= 10; i++) {
+						                    const role = options.getRole(`cargo${i}`);
+						                    const emoji = options.getString(`emoji${i}`);
+						                    if (role) {
+						                        items.push({ roleId: role.id, roleName: role.name, emoji: emoji || '🔹' });
+						                    }
+						                }
+						            }
+						
+						            if (items.length === 0) return reply("❌ Você precisa adicionar pelo menos um cargo.");
+						
+						            let listText = "";
+						            const selectMenu = new StringSelectMenuBuilder()
+						                .setCustomId('verify_select_menu')
+						                .setPlaceholder('Selecione um cargo para resgatar...');
+						
+						            items.forEach(item => {
+						                listText += `${item.emoji} <@&${item.roleId}>\n`;
+						                selectMenu.addOptions({
+						                    label: item.roleName,
+						                    value: item.roleId,
+						                    emoji: item.emoji
+						                });
+						            });
+						
+						            const embed = new EmbedBuilder()
+						                .setColor(globalConfig.embedColor)
+						                .setTitle(newTitle)
+						                .setDescription(`${newDescription}\n\n${listText}`)
+.setThumbnail(newThumb || (isEdit ? null : interaction.guild.iconURL({ dynamic: true })))
+							                .setTimestamp();
+
+							            if (newBanner) embed.setImage(newBanner);
+						
+						            const row = new ActionRowBuilder().addComponents(selectMenu);
+						
+						            if (isEdit) {
+						                try {
+						                    const message = await interaction.channel.messages.fetch(messageId);
+						                    await message.edit({ embeds: [embed], components: [row] });
+						                    verifyConfig[messageId] = { banner: newBanner, thumbnail: newThumb, title: newTitle, description: newDescription, items: items };
+						                    saveVerifyConfig();
+						                    return reply("✅ Painel de verificação editado com sucesso!");
+						                } catch (e) {
+						                    return reply("❌ Erro ao editar a mensagem. Verifique se ela está neste canal.");
+						                }
+						            } else {
+						                const sent = await interaction.channel.send({ embeds: [embed], components: [row] });
+						                verifyConfig[sent.id] = { banner: newBanner, thumbnail: newThumb, title: newTitle, description: newDescription, items: items };
+						                saveVerifyConfig();
+						                return reply(`✅ Painel enviado! ID: \`${sent.id}\``);
+						            }
+						        }
+					        case 'config-loja':
+					        case 'editar-loja':
+					        case 'editar-item':
+					        case 'atualizar-loja': {
 				            const isEdit = commandName === 'editar-loja';
 				            const isEditItem = commandName === 'editar-item';
 				            const isUpdate = commandName === 'atualizar-loja';
@@ -2011,9 +2761,10 @@ case 'antinuke': { if (!antinukeConfig[interaction.guildId]) antinukeConfig[inte
 				                return reply("❌ Não encontrei dados salvos para esta loja. Verifique o ID da mensagem.");
 				            }
 	
-					            let newBanner = currentShop ? currentShop.banner : options.getString('banner');
-						            let newTitle = currentShop ? currentShop.title : `<a:dollar39:1465353629849354556> Loja do Servidor | ${interaction.guild.name}`;
-						            let newDescription = currentShop ? currentShop.description : "Adquira cargos exclusivos utilizando seu saldo bancário!\n\n";
+let newBanner = currentShop ? currentShop.banner : options.getString('banner');
+							            let newThumb = currentShop ? currentShop.thumbnail : options.getString('thumbnail');
+							            let newTitle = currentShop ? currentShop.title : `<a:dollar39:1465353629849354556> Loja do Servidor | ${interaction.guild.name}`;
+							            let newDescription = currentShop ? currentShop.description : "Adquira cargos exclusivos utilizando seu saldo bancário!\n\n";
 						            let finalItems = currentShop ? JSON.parse(JSON.stringify(currentShop.items)) : [];
 		
 						            if (commandName === 'config-loja') {
@@ -2026,14 +2777,18 @@ case 'antinuke': { if (!antinukeConfig[interaction.guildId]) antinukeConfig[inte
 						                        finalItems.push({ roleId: role.id, roleName: role.name, price: price, emoji: '<a:money:1242505308442595408>' });
 						                    }
 						                }
-						            } else if (isEdit) {
-					                const bannerOpt = options.getString('banner');
-					                const titleOpt = options.getString('titulo');
-					                const descOpt = options.getString('descricao');
-					                if (bannerOpt) newBanner = bannerOpt;
-					                if (titleOpt) newTitle = titleOpt;
-					                if (descOpt) newDescription = descOpt;
-					            } else if (isEditItem) {
+} else if (isEdit) {
+						                const bannerOpt = options.getString('banner');
+						                const thumbOpt = options.getString('thumbnail');
+						                const titleOpt = options.getString('titulo');
+						                const descOpt = options.getString('descricao');
+						                if (bannerOpt === 'remover') newBanner = null;
+						                else if (bannerOpt) newBanner = bannerOpt;
+						                if (thumbOpt === 'remover') newThumb = null;
+						                else if (thumbOpt) newThumb = thumbOpt;
+						                if (titleOpt) newTitle = titleOpt;
+						                if (descOpt) newDescription = descOpt;
+						            } else if (isEditItem) {
 				                const itemIndex = options.getInteger('item_numero') - 1;
 				                const role = options.getRole('cargo');
 				                const price = options.getNumber('preco');
@@ -2055,9 +2810,9 @@ case 'antinuke': { if (!antinukeConfig[interaction.guildId]) antinukeConfig[inte
 				                .setColor(globalConfig.embedColor)
 				                .setTitle(newTitle)
 				                .setDescription(newDescription)
-				                .setImage(newBanner)
-				                .setThumbnail(interaction.guild.iconURL({ dynamic: true }))
-				                .setTimestamp();
+.setImage(newBanner)
+					                .setThumbnail(newThumb || (isEdit ? null : interaction.guild.iconURL({ dynamic: true })))
+					                .setTimestamp();
 				            
 				            const selectMenu = new StringSelectMenuBuilder()
 				                .setCustomId('shop_buy_menu')
@@ -2096,7 +2851,7 @@ case 'antinuke': { if (!antinukeConfig[interaction.guildId]) antinukeConfig[inte
 				                try {
 				                    const message = await interaction.channel.messages.fetch(messageId);
 				                    await message.edit({ embeds: [embed], components: [row] });
-				                    shopConfig[messageId] = { banner: newBanner, title: newTitle, description: newDescription, items: finalItems, messageId: messageId };
+				                    shopConfig[messageId] = { messageId: messageId, banner: newBanner, thumbnail: newThumb, title: newTitle, description: newDescription, items: finalItems };
 				                    saveShopConfig();
 				                    return reply(`✅ Loja ${isEdit ? 'editada' : isEditItem ? 'item editado' : 'atualizada'} com sucesso!`);
 				                } catch (e) {
@@ -2105,9 +2860,9 @@ case 'antinuke': { if (!antinukeConfig[interaction.guildId]) antinukeConfig[inte
 				                }
 					            } else {
 				                const sentMessage = await interaction.channel.send({ embeds: [embed], components: [row] });
-				                shopConfig[sentMessage.id] = { banner: newBanner, title: newTitle, description: newDescription, items: finalItems, messageId: sentMessage.id };
-				                saveShopConfig();
-					            return reply(`✅ Loja enviada com sucesso! ID: \`${sentMessage.id}\``);
+shopConfig[sentMessage.id] = { messageId: sentMessage.id, banner: newBanner, thumbnail: newThumb, title: newTitle, description: newDescription, items: finalItems };
+					                saveShopConfig();
+						            return reply(`✅ Loja enviada com sucesso! ID: \`${sentMessage.id}\``);
 					            }
 					            return;
 					        }
@@ -2153,7 +2908,7 @@ case 'antinuke': { if (!antinukeConfig[interaction.guildId]) antinukeConfig[inte
 				});
 	
 	// === OUTROS EVENTOS ===
-	client.on('guildCreate', async guild => { const channel = guild.channels.cache.find(c => c.type === 0 && c.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages)); if (channel) await channel.send(getSupportMessage(guild)).catch(() => {}); });
+
 		client.on('messageCreate', async message => {
 		    if (message.author.bot || !message.guild) return;
 
@@ -2366,18 +3121,26 @@ case 'antinuke': { if (!antinukeConfig[interaction.guildId]) antinukeConfig[inte
             const embed = new EmbedBuilder()
                 .setColor(globalConfig.embedColor)
                 .setTitle(`Bem-vindo(a) ao Void <:0knife:1419332665949032600>!`)
-                .setDescription(`Wsp ${member}.\nTemos agora ${member.guild.memberCount} membros.\n\nNão se esqueça de ler as regras!`)
+                .setDescription(`<a:blackheart:1362050539042377758> **Wsp** ${member}\n**não se esqueça de checar** <#1418634171164921919>.`)
                 .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 512 }))
-                .setImage('https://i.imgur.com/iPRDWR1.gif')
-                .setFooter({ text: `Usuário: ${member.user.tag} | ID: ${member.id}` })
+                .setFooter({ text: `Usuário: ${member.user.tag}` })
                 .setTimestamp();
-            await channel.send({ content: `👋 Olá, ${member}!`, embeds: [embed] });
+            await channel.send({ embeds: [embed] });
         }
     } catch (e) {
         console.error("Erro ao enviar mensagem de boas-vindas:", e);
     }
 });
-			client.on('voiceStateUpdate', async (oldState, newState) => {
+			client.on('channelUpdate', async (oldChannel, newChannel) => {
+    if (newChannel.type !== 2) return; // Apenas canais de voz
+    const ownerId = tempVcOwners.get(newChannel.id);
+    if (ownerId && oldChannel.name !== newChannel.name) {
+        customVoiceNames[ownerId] = newChannel.name;
+        saveCustomVoiceNames();
+    }
+});
+
+client.on('voiceStateUpdate', async (oldState, newState) => {
 			    const { guild, member } = newState;
 			    if (!member || member.user.bot) return; // Ignora bots
 			    
@@ -2389,11 +3152,12 @@ case 'antinuke': { if (!antinukeConfig[interaction.guildId]) antinukeConfig[inte
 			    if (config) {
 			        const { categoryId, createChannelId } = config;
 			
-			        if (newState.channelId === createChannelId) {
-			            try {
-			                const channel = await guild.channels.create({ name: `Sala de ${member.user.username}`, type: 2, parent: categoryId, permissionOverwrites: [{ id: member.id, allow: [PermissionsBitField.Flags.ManageChannels] }] });
-			                await member.voice.setChannel(channel);
-			                tempVcOwners.set(channel.id, member.id);
+				        if (newState.channelId === createChannelId) {
+				            try {
+				                const savedName = customVoiceNames[member.id] || `Sala de ${member.user.username}`;
+				                const channel = await guild.channels.create({ name: savedName, type: 2, parent: categoryId, permissionOverwrites: [{ id: member.id, allow: [PermissionsBitField.Flags.ManageChannels] }] });
+				                await member.voice.setChannel(channel);
+				                tempVcOwners.set(channel.id, member.id);
 			                await sendLog(guild, new EmbedBuilder().setColor(globalConfig.embedColor).setTitle("🎤 Nova Sala Temporária").setColor(globalConfig.embedColor).setDescription(`### 🏠 Sala Criada
 
 > **Dono:** ${member}
@@ -2484,6 +3248,226 @@ async function handleJoinVC(interaction) {
         return interaction.reply({ content: "❌ Ocorreu um erro ao tentar conectar ao canal de voz.", ephemeral: true });
     }
 }
+
+
+
+    
+    
+    // === SISTEMA DE CORREIO ELEGANTE (TELL) ===
+
+function saveVoidSmsConfig() { saveConfig('./tell_config.json', voidSmsConfig); }
+
+async function generateVoidSmsImage(options) {
+    const { recipientName = 'Usuário', recipientAvatar = '', senderName = 'Anônimo', senderAvatar = '', message = '', isAnonymous = false } = options;
+    const width = 600; const height = 400;
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext('2d');
+    
+    // Fundo branco
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, width, height);
+    
+    // Barra preta lateral esquerda
+    ctx.fillStyle = '#000102'; ctx.fillRect(0, 0, 5, height);
+    
+    // Título "MENSAGEM"
+    ctx.fillStyle = '#000102'; ctx.font = 'bold 24px Arial'; ctx.fillText('MENSAGEM', 30, 40);
+    
+    // Badge de status (Anônimo/Público)
+    const badgeText = isAnonymous ? 'ANÔNIMO' : 'PÚBLICO';
+    ctx.fillStyle = isAnonymous ? '#ff6b6b' : '#51cf66';
+    const badgeWidth = ctx.measureText(badgeText).width + 20;
+    ctx.beginPath(); ctx.roundRect(width - 50 - badgeWidth, 20, badgeWidth, 30, 5); ctx.fill();
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 12px Arial'; ctx.fillText(badgeText, width - 40 - badgeWidth, 40);
+    
+    // Linha separadora
+    ctx.strokeStyle = '#e0e0e0'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(30, 60); ctx.lineTo(width - 30, 60); ctx.stroke();
+    
+        // Função auxiliar para carregar e desenhar avatar redondo (corrigida para Node.js moderno)
+    const drawAvatar = async (avatarUrl, x, y, size = 30) => {
+        try {
+            if (!avatarUrl) return;
+            const response = await fetch(avatarUrl);
+            if (!response.ok) throw new Error(`Falha ao baixar avatar: ${response.statusText}`);
+            
+            // Forma universal de pegar o buffer em Node.js moderno
+            const arrayBuffer = await response.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            
+            const img = new (require('canvas').Image)();
+            img.src = buffer;
+            
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(x + size/2, y + size/2, size/2, 0, Math.PI * 2);
+            ctx.closePath();
+            ctx.clip();
+            ctx.drawImage(img, x, y, size, size);
+            ctx.restore();
+        } catch (e) {
+            console.log("Erro ao carregar avatar:", e.message);
+        }
+    };
+    
+    // Desenhar avatares (se disponíveis)
+    if (recipientAvatar) await drawAvatar(recipientAvatar, 30, 75, 35);
+    if (senderAvatar && !isAnonymous) await drawAvatar(senderAvatar, 30, 135, 35);
+    
+    // Seção "Para" com avatar
+    ctx.fillStyle = '#666666'; ctx.font = '12px Arial'; ctx.fillText('Para', 75, 90);
+    ctx.fillStyle = '#000102'; ctx.font = 'bold 14px Arial'; ctx.fillText(recipientName, 75, 110);
+    
+    // Seção "De" com avatar
+    ctx.fillStyle = '#666666'; ctx.font = '12px Arial'; ctx.fillText('De', 75, 150);
+    ctx.fillStyle = '#000102'; ctx.font = 'bold 14px Arial'; ctx.fillText(senderName, 75, 170);
+    
+    // Mensagem
+    ctx.fillStyle = '#333333'; ctx.font = '14px Arial';
+    const words = message.split(' '); let line = ''; let y = 220;
+    for (let word of words) {
+        if (ctx.measureText(line + word).width > 540) { ctx.fillText(line, 30, y); line = word + ' '; y += 20; }
+        else { line += word + ' '; }
+    }
+    ctx.fillText(line, 30, y);
+    
+    // Data de envio
+    ctx.fillStyle = '#999999'; ctx.font = '11px Arial';
+    ctx.fillText(`Enviado em ${new Date().toLocaleDateString('pt-BR')}`, 30, height - 20);
+    
+    return canvas.toBuffer('image/png');
+}
+
+async function handleVoidSmsModal(interaction) {
+    const recipientInput = interaction.fields.getTextInputValue('voidsms_recipient');
+    const messageContent = interaction.fields.getTextInputValue('voidsms_message');
+    const anonymousInput = interaction.fields.getTextInputValue('voidsms_anonymous').toLowerCase();
+    const isAnonymous = anonymousInput === 'sim';
+    const TELL_COST = 2500;
+
+        // Tentar encontrar o usuário por ID (se for menção ou ID)
+    let recipientId = recipientInput.replace(/[<@!>]/g, '');
+    let recipient = await interaction.client.users.fetch(recipientId).catch(() => null);
+    
+    // Se não encontrou por ID, tentar por busca de nome (forma otimizada para evitar Timeout)
+    if (!recipient) {
+        try {
+            const foundMembers = await interaction.guild.members.search({ query: recipientInput, limit: 1 });
+            const foundMember = foundMembers.first();
+            if (foundMember) {
+                recipient = foundMember.user;
+            }
+        } catch (e) {
+            console.log("Erro na busca de membros:", e.message);
+        }
+    }
+    
+    if (!recipient) return interaction.reply({ content: '<a:xo_cross:1477009057427624072> Usuário não encontrado. Tente digitar o nome completo ou mencionar a pessoa.', ephemeral: true });
+    
+    if (recipient.id === interaction.user.id) return interaction.reply({ content: '<a:xo_cross:1477009057427624072> Você não pode enviar uma mensagem para você mesmo.', ephemeral: true });
+
+    if (!voidSmsConfig.messagesChannelId) return interaction.reply({ content: '<a:xo_cross:1477009057427624072> Canal de mensagens não configurado.', ephemeral: true });
+    const channel = interaction.guild.channels.cache.get(voidSmsConfig.messagesChannelId);
+    if (!channel) return interaction.reply({ content: '<a:xo_cross:1477009057427624072> Canal de mensagens não encontrado.', ephemeral: true });
+
+    // Verificar saldo do usuário
+    const userId = interaction.user.id;
+    const user = getUser(userId, interaction.user.tag);
+    if (user.bank < TELL_COST) {
+        const needed = TELL_COST - user.bank;
+        return interaction.reply({ content: `<a:xo_cross:1477009057427624072> Você não tem saldo suficiente! Custa **$${formatDollars(TELL_COST)}** e você tem apenas **$${formatDollars(user.bank)}**. Você precisa de mais **$${formatDollars(needed)}**.`, ephemeral: true });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+    
+    // Descontar o custo
+    user.bank -= TELL_COST;
+    updateUser(userId, user);
+
+        const imageBuffer = await generateVoidSmsImage({
+        recipientName: recipient.username,
+        recipientAvatar: recipient.displayAvatarURL({ extension: 'png', size: 256 }),
+        senderName: isAnonymous ? 'Anônimo' : interaction.user.username,
+        senderAvatar: isAnonymous ? '' : interaction.user.displayAvatarURL({ extension: 'png', size: 256 }),
+        message: messageContent,
+        isAnonymous: isAnonymous
+    });
+
+    const attachment = new AttachmentBuilder(imageBuffer, { name: 'voidsms.png' });
+    const embed = new EmbedBuilder()
+        .setColor('#000102')
+        .setTitle('<a:1689ringingphone:1477618877369290906> Void SMS - Nova Mensagem')
+        .setDescription(`${recipient}, você recebeu uma **${isAnonymous ? 'mensagem anônima' : 'mensagem pública'}**!`)
+        .setImage('attachment://voidsms.png')
+        .setFooter({ text: 'Void SMS - Sistema de Mensagens' });
+    
+    await channel.send({ content: `${recipient}`, embeds: [embed], files: [attachment] });
+    
+    // Sistema de Log de SMS
+    if (voidSmsConfig.logChannelId) {
+        const logChannel = interaction.guild.channels.cache.get(voidSmsConfig.logChannelId);
+        if (logChannel) {
+            const logEmbed = new EmbedBuilder()
+                .setColor('#000102')
+                .setTitle('📝 Log de Void SMS')
+                .addFields(
+                    { name: 'Autor', value: `${interaction.user} (${interaction.user.id})`, inline: true },
+                    { name: 'Destinatário', value: `${recipient} (${recipient.id})`, inline: true },
+                    { name: 'Anônimo', value: isAnonymous ? 'Sim' : 'Não', inline: true },
+                    { name: 'Mensagem', value: messageContent }
+                )
+                .setTimestamp();
+            await logChannel.send({ embeds: [logEmbed] });
+        }
+    }
+
+    await interaction.editReply({ content: `<a:checkmark_void88:1320743200591188029> Mensagem enviada para **${recipient.username}**! Você pagou **$${formatDollars(TELL_COST)}** pelo Void SMS.` });
+}
+
+// === CHECK DE BUMP TIMER ===
+setInterval(async () => {
+    const now = Date.now();
+    for (const guildId in bumpConfig) {
+        const config = bumpConfig[guildId];
+        if (config.nextBump > 0 && now >= config.nextBump && !config.notified) {
+            config.notified = true;
+            saveBumpConfig();
+
+            try {
+                const guild = client.guilds.cache.get(guildId);
+                if (!guild) continue;
+
+                let usersToNotify = [];
+                if (config.roleId) {
+                    try {
+                        const role = await guild.roles.fetch(config.roleId);
+                        if (role) {
+                            // Garante que os membros do cargo estão carregados
+                            const members = await guild.members.fetch();
+                            usersToNotify = members.filter(m => m.roles.cache.has(config.roleId)).map(m => m.user);
+                        }
+                    } catch (e) {
+                        console.error(`Erro ao buscar membros do cargo ${config.roleId}:`, e);
+                    }
+                }
+
+                const embed = new EmbedBuilder()
+                    .setColor('#000102')
+                    .setTitle('<a:rocket:1466151179049238549> Bump Disponível!')
+                    .setDescription(`O tempo de espera de 2 horas acabou no servidor **${guild.name}**!\nO bump já pode ser feito novamente.`)
+                    .setTimestamp();
+
+                for (const user of usersToNotify) {
+                    try {
+                        await user.send({ embeds: [embed] });
+                    } catch (e) {
+                        console.error(`Não foi possível enviar DM para ${user.tag}`);
+                    }
+                }
+            } catch (e) {
+                console.error(`Erro ao processar notificação de bump para guilda ${guildId}:`, e);
+            }
+        }
+    }
+}, 60000); // Checa a cada minuto
 
 client.login(process.env.TOKEN);
 
